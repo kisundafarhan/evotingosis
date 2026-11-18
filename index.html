@@ -253,6 +253,12 @@ table.tbl{width:100%;border-collapse:collapse;font-size:14px}
   .pr-qr svg{width:24mm;height:24mm;display:block}.pr-qr.big{align-self:center}.pr-qr.big svg{width:32mm;height:32mm}
   @page{size:A4;margin:10mm}
 }
+
+/* Halaman yang menunggu data besar (daftar pemilih/suara) dimuat */
+.pg.ld{position:relative;min-height:240px}
+.ld-ov{position:absolute;inset:0;z-index:5;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding-top:80px;gap:12px;background:rgba(255,255,255,.82);backdrop-filter:blur(3px);color:var(--c-navy);border-radius:16px}
+.spin{width:34px;height:34px;border-radius:50%;border:4px solid var(--c-blue1);border-top-color:var(--c-blue6);animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 </style></head><body style="margin:0">
 <div id="ev" aria-live="off"><div id="ev-view"></div><div id="ev-modal"></div><div class="toasts" id="ev-toasts"></div><div class="net" id="ev-net" hidden><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3l18 18"/><path d="M8.5 16a5 5 0 0 1 7 0M12 19.5h.01M5 12.5a10 10 0 0 1 5-2.6"/></svg> Tidak ada koneksi internet</div></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
@@ -381,6 +387,37 @@ function parseKelas(raw) {
   const m = k.match(/^(XII|XI|X)(?=[.\-_]|\d|$)/);
   return m ? { kelas: k.replace(/[-_]/g, "."), tingkat: m[1] } : null;
 }
+// ---------- Penghitung (stats/main): dokumen kecil agar dashboard tidak membaca ribuan dokumen ----------
+// Bentuk: { votes, voted, total, cand:{calonId:n}, bilik:{nama:n}, kelas:{kelas:{t:totalPemilih, v:sudahMemilih}} }
+// Rahasia suara: dokumen suara hanya berisi calon dan kelas (tanpa waktu/bilik), jadi 'bilik' menghitung PEMILIH per bilik (dari data pemilih), bukan suara.
+const STATS_ID = "main";
+function buildStats(voters, votes) {
+  const s = { votes: votes.length, voted: 0, total: voters.length, cand: {}, bilik: {}, kelas: {} };
+  votes.forEach((v) => { s.cand[v.calonId] = (s.cand[v.calonId] || 0) + 1; });
+  voters.forEach((v) => { const o = s.kelas[v.kelas] || (s.kelas[v.kelas] = { t: 0, v: 0 }); o.t++; if (v.sudahMemilih) { o.v++; s.voted++; const b = v.bilik || "-"; s.bilik[b] = (s.bilik[b] || 0) + 1; } });
+  return s;
+}
+// Selisih (delta) penghitung untuk satu operasi. s = +1 menambah, -1 mengurangi.
+const newDelta = () => ({ votes: 0, voted: 0, total: 0, cand: {}, bilik: {}, kelas: {} });
+const dAdd = (o, k, n) => { o[k] = (o[k] || 0) + n; };
+const dKelas = (d, k) => d.kelas[k] || (d.kelas[k] = { t: 0, v: 0 });
+function dVoter(d, v, s) { d.total += s; dKelas(d, v.kelas).t += s; if (v.sudahMemilih) dVoted(d, v, s); }
+function dVote(d, v, s) { d.votes += s; dAdd(d.cand, v.calonId, s); }
+function dVoted(d, v, s) { d.voted += s; dKelas(d, v.kelas).v += s; dAdd(d.bilik, v.bilik || "-", s); }
+function mergeDelta(a, b) {
+  a.votes += b.votes; a.voted += b.voted; a.total += b.total;
+  for (const k in b.cand) dAdd(a.cand, k, b.cand[k]); for (const k in b.bilik) dAdd(a.bilik, k, b.bilik[k]);
+  for (const k in b.kelas) { const o = dKelas(a, k); o.t += b.kelas[k].t; o.v += b.kelas[k].v; }
+  return a;
+}
+// Daftar [jalur, selisih] yang tidak nol; dipakai untuk updateDoc(increment) di Firestore
+function deltaPaths(d) {
+  const out = [], add = (path, n) => { if (n) out.push([path, n]); };
+  add(["votes"], d.votes); add(["voted"], d.voted); add(["total"], d.total);
+  for (const k in d.cand) add(["cand", k], d.cand[k]); for (const k in d.bilik) add(["bilik", k], d.bilik[k]);
+  for (const k in d.kelas) { add(["kelas", k, "t"], d.kelas[k].t); add(["kelas", k, "v"], d.kelas[k].v); }
+  return out;
+}
 const TINGKAT = ["X", "XI", "XII", "GURU"];
 const normId = (s) => String(s ?? "").trim().toUpperCase();
 const isGuru = (v) => !!v && (v.tingkat === "GURU" || v.kategori === "guru");
@@ -419,9 +456,9 @@ const toMs = (t) => (t && typeof t.toMillis === "function" ? t.toMillis() : type
 
 async function createMemDB() {
   const st = { settings: { ...DEFAULT_SETTINGS, status: "buka", namaPemilihan: "Pemilihan Ketua OSIS (Preview)" }, cands: [], voters: new Map(), tokens: new Map(), votes: [] };
-  const L = { settings: new Set(), cands: new Set(), voters: new Set(), votes: new Set() };
+  const L = { settings: new Set(), cands: new Set(), voters: new Set(), votes: new Set(), stats: new Set(), recent: new Set() };
   let user = null; const authL = new Set();
-  const snap = (k) => k === "settings" ? { ...st.settings } : k === "cands" ? st.cands.map((x) => ({ ...x })) : k === "voters" ? [...st.voters.values()].map((x) => ({ ...x })) : st.votes.map((x) => ({ ...x }));
+  const snap = (k) => k === "settings" ? { ...st.settings } : k === "cands" ? st.cands.map((x) => ({ ...x })) : k === "voters" ? [...st.voters.values()].map((x) => ({ ...x })) : k === "stats" ? buildStats([...st.voters.values()], st.votes) : k === "recent" ? [...st.voters.values()].filter((v) => v.sudahMemilih).sort((a, b) => (b.waktuMemilih || 0) - (a.waktuMemilih || 0)).slice(0, 100).map((x) => ({ ...x })) : st.votes.map((x) => ({ ...x }));
   const emit = (k) => L[k].forEach((f) => f(snap(k)));
   const watch = (k) => (cb) => { L[k].add(cb); cb(snap(k)); return () => L[k].delete(cb); };
   const lag = () => sleep(120);
@@ -448,7 +485,8 @@ async function createMemDB() {
       user = e; authL.forEach((f) => f(user));
     },
     async signOut() { user = null; authL.forEach((f) => f(null)); },
-    watchSettings: watch("settings"), watchCands: watch("cands"), watchVoters: watch("voters"), watchVotes: watch("votes"),
+    watchSettings: watch("settings"), watchCands: watch("cands"), watchVoters: watch("voters"), watchVotes: watch("votes"), watchStats: watch("stats"), watchRecent: watch("recent"),
+    async recomputeStats() { emit("stats"); }, async verifyStats() { const s = buildStats([...st.voters.values()], st.votes); return { votes: s.votes, voted: s.voted, total: s.total }; },
     async saveSettings(p) { await lag(); st.settings = { ...st.settings, ...p }; emit("settings"); },
     async saveCandidate(c) {
       await lag(); const id = c.id || newId(); const i = st.cands.findIndex((x) => x.id === id);
@@ -463,10 +501,10 @@ async function createMemDB() {
         else { const v = st.voters.get(it.nipd); if (v) Object.assign(v, { nama: it.nama, kelas: it.kelas, tingkat: it.tingkat, kategori: it.kategori || "siswa" }); }
         if (i % 200 === 0) onProgress?.(i, items.length);
       });
-      onProgress?.(items.length, items.length); await lag(); emit("voters");
+      onProgress?.(items.length, items.length); await lag(); emit("voters"); emit("stats");
     },
     async regenTokens(items) { items.forEach((it) => { const v = st.voters.get(it.nipd); if (v) { v.tokenHash = it.tokenHash; st.tokens.set(it.nipd, it.token); } }); await lag(); emit("voters"); },
-    async deleteVoters(nipds, onProgress) { nipds.forEach((n) => { st.voters.delete(n); st.tokens.delete(n); }); onProgress?.(nipds.length, nipds.length); await lag(); emit("voters"); },
+    async deleteVoters(list, onProgress) { list.forEach((x) => { st.voters.delete(x.nipd); st.tokens.delete(x.nipd); }); onProgress?.(list.length, list.length); await lag(); emit("voters"); emit("stats"); },
     async castVote({ nipd, calonId, kelas, bilik, voteId }) {
       await lag(); const v = st.voters.get(nipd);
       if (!v) throw Object.assign(new Error("x"), { code: "not-found" });
@@ -474,12 +512,12 @@ async function createMemDB() {
       if (st.settings.status !== "buka") throw Object.assign(new Error("x"), { code: "permission-denied" });
       if (!st.cands.some((c) => c.id === calonId)) throw Object.assign(new Error("x"), { code: "permission-denied" });
       const now = Date.now();
-      st.votes.push({ id: voteId, calonId, kelas, bilik, waktu: now });
+      st.votes.push({ id: voteId, calonId, kelas });
       Object.assign(v, { sudahMemilih: true, waktuMemilih: now, bilik });
-      emit("votes"); emit("voters");
+      emit("votes"); emit("voters"); emit("stats"); emit("recent");
     },
-    async deleteVotes(ids, onProgress) { const s = new Set(ids); st.votes = st.votes.filter((x) => !s.has(x.id)); onProgress?.(ids.length, ids.length); await lag(); emit("votes"); },
-    async resetVoterStatus(nipds, onProgress) { nipds.forEach((n) => { const v = st.voters.get(n); if (v) Object.assign(v, { sudahMemilih: false, waktuMemilih: null, bilik: null }); }); onProgress?.(nipds.length, nipds.length); await lag(); emit("voters"); }
+    async deleteVotes(list, onProgress) { const s = new Set(list.map((x) => x.id)); st.votes = st.votes.filter((x) => !s.has(x.id)); onProgress?.(list.length, list.length); await lag(); emit("votes"); emit("stats"); emit("recent"); },
+    async resetVoterStatus(list, onProgress) { list.forEach((x) => { const v = st.voters.get(x.nipd); if (v) Object.assign(v, { sudahMemilih: false, waktuMemilih: null, bilik: null }); }); onProgress?.(list.length, list.length); await lag(); emit("voters"); emit("stats"); }
   };
 }
 
@@ -493,14 +531,28 @@ async function createFsDB() {
   const ts = () => fsM.serverTimestamp();
   const est = { serverTimestamps: "estimate" };
 
-  async function runBatches(fns, onProgress) {
+  const statsRef = () => ref("stats", STATS_ID);
+  // Argumen updateDoc(ref, jalur1, nilai1, jalur2, nilai2, ...) dari selisih penghitung
+  const statsArgs = (d) => deltaPaths(d).flatMap(([path, n]) => [new fsM.FieldPath(...path), fsM.increment(n)]);
+  // fns: fungsi (batch) => void; tiap fungsi boleh membawa .d (selisih penghitung) yang ikut ditulis atomik pada batch yang sama
+  async function runBatches(fns, onProgress, withStats = false) {
     const SIZE = 400;
+    const wantStats = withStats && fns.some((f) => f.d); let useStats = false, canStats = true;
+    if (wantStats) { try { useStats = (await fsM.getDoc(statsRef())).exists(); } catch (e) { canStats = false; } } // aturan lama (tanpa blok stats): data tetap ditulis, penghitung dilewati
     for (let i = 0; i < fns.length; i += SIZE) {
-      const b = fsM.writeBatch(db);
-      fns.slice(i, i + SIZE).forEach((f) => f(b));
+      const b = fsM.writeBatch(db), part = fns.slice(i, i + SIZE);
+      part.forEach((f) => f(b));
+      if (useStats) { const d = part.reduce((acc, f) => (f.d ? mergeDelta(acc, f.d) : acc), newDelta()), args = statsArgs(d); if (args.length) b.update(statsRef(), ...args); }
       await b.commit();
       onProgress?.(Math.min(i + SIZE, fns.length), fns.length);
     }
+    if (wantStats && canStats && !useStats) { try { await recomputeStats(); } catch (e) { /* penghitung gagal dibangun: data sudah tertulis, dashboard akan menawarkan hitung ulang */ } } // dokumen penghitung belum ada: bangun dari data asli
+  }
+  const withD = (fn, d) => { fn.d = d; return fn; };
+  async function recomputeStats() {
+    const [vs, vt] = await Promise.all([fsM.getDocs(col("voters")), fsM.getDocs(col("votes"))]);
+    const s = buildStats(vs.docs.map((d) => ({ id: d.id, ...d.data() })), vt.docs.map((d) => ({ id: d.id, ...d.data() })));
+    await fsM.setDoc(statsRef(), s);
   }
 
   return {
@@ -511,7 +563,17 @@ async function createFsDB() {
     watchSettings: (cb, err) => fsM.onSnapshot(ref("settings", "main"), (s) => cb({ ...DEFAULT_SETTINGS, ...(s.exists() ? s.data() : {}) }), err),
     watchCands: (cb, err) => fsM.onSnapshot(col("candidates"), (s) => cb(s.docs.map((d) => ({ id: d.id, ...d.data() }))), err),
     watchVoters: (cb, err) => fsM.onSnapshot(col("voters"), (s) => cb(s.docs.map((d) => { const x = d.data(est); return { id: d.id, ...x, waktuMemilih: toMs(x.waktuMemilih) }; })), err),
-    watchVotes: (cb, err) => fsM.onSnapshot(col("votes"), (s) => cb(s.docs.map((d) => { const x = d.data(est); return { id: d.id, ...x, waktu: toMs(x.waktu) }; })), err),
+    watchVotes: (cb, err) => fsM.onSnapshot(col("votes"), (s) => cb(s.docs.map((d) => ({ id: d.id, ...d.data(est) }))), err),
+    // Penghitung: satu dokumen kecil. null = belum ada (dibangun otomatis oleh admin)
+    watchStats: (cb, err) => fsM.onSnapshot(statsRef(), (s) => cb(s.exists() ? s.data() : null), err),
+    // 100 pemilih yang terakhir memilih (siapa dan kapan, TANPA pilihannya), untuk log di menu Kotak Suara. Pemilih yang belum memilih bernilai null dan terurut paling akhir.
+    watchRecent: (cb, err) => fsM.onSnapshot(fsM.query(col("voters"), fsM.orderBy("waktuMemilih", "desc"), fsM.limit(100)), (s) => cb(s.docs.map((d) => { const x = d.data(est); return { id: d.id, ...x, waktuMemilih: toMs(x.waktuMemilih) }; }).filter((x) => x.waktuMemilih)), err),
+    recomputeStats,
+    // Hitung jumlah dokumen di server (murah: 1 pembacaan per 1.000 dokumen) untuk memeriksa penghitung
+    async verifyStats() {
+      const [v, n, m] = await Promise.all([fsM.getCountFromServer(col("votes")), fsM.getCountFromServer(col("voters")), fsM.getCountFromServer(fsM.query(col("voters"), fsM.where("sudahMemilih", "==", true)))]);
+      return { votes: v.data().count, total: n.data().count, voted: m.data().count };
+    },
     saveSettings: (p) => fsM.setDoc(ref("settings", "main"), p, { merge: true }),
     async saveCandidate(c) { const id = c.id || newId(); const { id: _x, ...data } = c; await fsM.setDoc(ref("candidates", id), data); return id; },
     deleteCandidate: (id) => fsM.deleteDoc(ref("candidates", id)),
@@ -525,30 +587,46 @@ async function createFsDB() {
       const ops = [];
       items.forEach((it) => {
         if (it.isNew) {
-          ops.push((b) => b.set(ref("voters", it.nipd), { nipd: it.nipd, nama: it.nama, kelas: it.kelas, tingkat: it.tingkat, kategori: it.kategori || "siswa", tokenHash: it.tokenHash, sudahMemilih: false, waktuMemilih: null, bilik: null, dibuat: ts() }));
+          const d = newDelta(); dVoter(d, { kelas: it.kelas, sudahMemilih: false }, 1);
+          ops.push(withD((b) => b.set(ref("voters", it.nipd), { nipd: it.nipd, nama: it.nama, kelas: it.kelas, tingkat: it.tingkat, kategori: it.kategori || "siswa", tokenHash: it.tokenHash, sudahMemilih: false, waktuMemilih: null, bilik: null, dibuat: ts() }), d));
           ops.push((b) => b.set(ref("voterTokens", it.nipd), { token: it.token }));
-        } else ops.push((b) => b.update(ref("voters", it.nipd), { nama: it.nama, kelas: it.kelas, tingkat: it.tingkat, kategori: it.kategori || "siswa" }));
+        } else {
+          const d = newDelta(); // it.prev = data lama {kelas, sudahMemilih}; jika kelas berubah, pindahkan hitungannya
+          if (it.prev && it.prev.kelas !== it.kelas) { dVoter(d, it.prev, -1); dVoter(d, { kelas: it.kelas, sudahMemilih: !!it.prev.sudahMemilih }, 1); }
+          ops.push(withD((b) => b.update(ref("voters", it.nipd), { nama: it.nama, kelas: it.kelas, tingkat: it.tingkat, kategori: it.kategori || "siswa" }), d));
+        }
       });
-      await runBatches(ops, onProgress);
+      await runBatches(ops, onProgress, true);
     },
     async regenTokens(items, onProgress) {
       const ops = [];
       items.forEach((it) => { ops.push((b) => b.update(ref("voters", it.nipd), { tokenHash: it.tokenHash })); ops.push((b) => b.set(ref("voterTokens", it.nipd), { token: it.token })); });
       await runBatches(ops, onProgress);
     },
-    async deleteVoters(nipds, onProgress) {
+    async deleteVoters(list, onProgress) {
       const ops = [];
-      nipds.forEach((n) => { ops.push((b) => b.delete(ref("voters", n))); ops.push((b) => b.delete(ref("voterTokens", n))); });
-      await runBatches(ops, onProgress);
+      list.forEach((v) => { const d = newDelta(); dVoter(d, v, -1); ops.push(withD((b) => b.delete(ref("voters", v.nipd)), d)); ops.push((b) => b.delete(ref("voterTokens", v.nipd))); });
+      await runBatches(ops, onProgress, true);
     },
     async castVote({ nipd, calonId, kelas, bilik, voteId }) {
-      const b = fsM.writeBatch(db);
-      b.set(ref("votes", voteId), { calonId, kelas, bilik, waktu: ts() });
-      b.update(ref("voters", nipd), { sudahMemilih: true, waktuMemilih: ts(), bilik });
-      await Promise.race([b.commit(), sleep(15000).then(() => { throw Object.assign(new Error("timeout"), { code: "timeout" }); })]);
+      const build = (withStats) => {
+        const b = fsM.writeBatch(db);
+        b.set(ref("votes", voteId), { calonId, kelas }); // tanpa waktu dan bilik: suara tidak bisa dicocokkan dengan pemilih lewat jam/bilik
+        b.update(ref("voters", nipd), { sudahMemilih: true, waktuMemilih: ts(), bilik });
+        if (withStats) { const d = newDelta(); dVote(d, { calonId }, 1); dVoted(d, { kelas, bilik }, 1); b.update(statsRef(), ...statsArgs(d)); }
+        return b;
+      };
+      const commit = (b) => Promise.race([b.commit(), sleep(15000).then(() => { throw Object.assign(new Error("timeout"), { code: "timeout" }); })]);
+      try { await commit(build(true)); }
+      catch (e) {
+        // Penghitung tidak boleh menggagalkan suara: jika dokumennya belum ada atau aturan lama menolaknya, simpan suara tanpa penghitung.
+        // Jika penyebabnya lain (sudah memilih, pemungutan ditutup), percobaan kedua ini ikut ditolak dan error aslinya sampai ke pemilih.
+        const c = String((e && e.code) || "");
+        if (c.includes("permission-denied") || c.includes("not-found")) await commit(build(false)); else throw e;
+      }
     },
-    deleteVotes: (ids, onProgress) => runBatches(ids.map((id) => (b) => b.delete(ref("votes", id))), onProgress),
-    resetVoterStatus: (nipds, onProgress) => runBatches(nipds.map((n) => (b) => b.update(ref("voters", n), { sudahMemilih: false, waktuMemilih: null, bilik: null })), onProgress)
+    deleteVotes: (list, onProgress) => runBatches(list.map((v) => { const d = newDelta(); dVote(d, v, -1); return withD((b) => b.delete(ref("votes", v.id)), d); }), onProgress, true),
+    resetVoterStatus: (list, onProgress) => runBatches(list.map((v) => { const d = newDelta(); if (v.sudahMemilih) dVoted(d, v, -1); return withD((b) => b.update(ref("voters", v.nipd), { sudahMemilih: false, waktuMemilih: null, bilik: null }), d); }), onProgress, true)
   };
 }
 
@@ -562,7 +640,7 @@ function explainErr(e) {
 }
 
 // ---------- State global & komponen UI dasar ----------
-const S = { db: null, email: null, role: null, settings: { ...DEFAULT_SETTINGS }, cands: [], voters: [], votes: [], unsubs: [], ready: { settings: false, cands: false, voters: false, votes: false } };
+const S = { db: null, email: null, role: null, settings: { ...DEFAULT_SETTINGS }, cands: [], voters: [], votes: [], stats: null, recent: [], unsubs: [], lazy: {}, ready: { settings: false, cands: false, voters: false, votes: false, stats: false, recent: false } };
 const view = () => $("#ev-view");
 let lastErrAt = 0;
 
@@ -646,7 +724,7 @@ function onData(kind) {
 async function onAuthChange(email) {
   Voter.stop(); Admin.stop(); clearSubs();
   S.email = email; S.role = roleOf(email);
-  S.cands = []; S.voters = []; S.votes = []; S.ready = { settings: false, cands: false, voters: false, votes: false };
+  S.cands = []; S.voters = []; S.votes = []; S.stats = null; S.statsErr = null; S.recent = []; S.lazy = {}; S.ready = { settings: false, cands: false, voters: false, votes: false, stats: false, recent: false };
   if (S.role === "admin" && S.exitAfterAdmin) { S.exitAfterAdmin = false; await S.db.signOut(); return; } // keluar dari mode bilik setelah sandi admin benar
   if (!S.role) return renderStaffLogin();
   if (S.role === "unknown") { await S.db.signOut(); return renderStaffLogin("Akun ini tidak terdaftar sebagai panitia atau bilik."); }
@@ -655,10 +733,8 @@ async function onAuthChange(email) {
   const sub = (fn, kind, assign) => S.unsubs.push(fn((d) => { assign(d); onData(kind); }, dataErr));
   sub(S.db.watchSettings, "settings", (d) => { S.settings = { ...DEFAULT_SETTINGS, ...d }; });
   sub(S.db.watchCands, "cands", (d) => { S.cands = d; });
-  if (S.role === "admin") {
-    sub(S.db.watchVoters, "voters", (d) => { S.voters = d; });
-    sub(S.db.watchVotes, "votes", (d) => { S.votes = d; });
-  }
+  // Admin selalu memantau penghitung (1 dokumen kecil). Daftar pemilih/suara lengkap hanya dimuat saat halaman yang butuh dibuka (lihat Admin.syncNeeds).
+  if (S.role === "admin") S.unsubs.push(S.db.watchStats((d) => { S.statsErr = null; S.stats = d; onData("stats"); }, (e) => { S.statsErr = e; dataErr(e); Admin.onData("statsErr"); }));
 }
 
 // ---------- Foto pasangan calon: satu foto untuk Ketua + Wakil ----------
@@ -878,6 +954,11 @@ const Voter = (() => {
       await S.db.castVote({ nipd: V.voter.nipd, calonId: V.choice, kelas: V.voter.kelas, bilik: "Bilik " + bilikNo(), voteId: V.voteId });
       V.sending = false; close(); done();
     } catch (er) {
+      // Koneksi lambat/putus: penulisan pertama bisa saja tetap sampai ke server belakangan. Jika pemilih ini sudah tercatat memilih dari bilik ini, anggap sukses.
+      const ec = String((er && er.code) || "");
+      if (ec.includes("permission-denied") || ec === "timeout" || ec.includes("unavailable")) {
+        try { const cur = await S.db.getVoter(V.voter.nipd); if (cur && cur.sudahMemilih && cur.bilik === "Bilik " + bilikNo()) { V.sending = false; close(); return done(); } } catch (e2) { /* lanjut tampilkan error asli */ }
+      }
       V.sending = false; setBusy(btn, false); $("#cf-back").disabled = false;
       const denied = String(er.code || "").includes("permission-denied");
       $("#cf-err").innerHTML = `<div class="alert err">${ic("alert")}<div>${denied ? "Suara ditolak. Pemilih ini mungkin sudah memilih atau pemungutan suara ditutup. Hubungi panitia." : esc(explainErr(er)) + " Tekan tombol kirim untuk mencoba lagi."}</div></div>`;
@@ -916,11 +997,14 @@ const A = { page: "dash", cur: null, raf: 0, tokens: null, P: { q: "", kat: "", 
 const Pages = {};
 const NAV = [["dash", "Dashboard", "dash"], ["voters", "Data Pemilih", "users"], ["tokens", "Cetak Token", "key"], ["cands", "Data Calon", "user"], ["box", "Kotak Suara", "box"], ["reset", "Reset & Pengelolaan", "reset"], ["set", "Pengaturan", "sliders"]];
 const BOTTOM = ["dash", "voters", "cands", "box"];
+// Data besar hanya dimuat (dan dibaca dari Firestore) selama halaman yang membutuhkannya terbuka
+const NEEDS = { voters: ["voters"], tokens: ["voters"], reset: ["voters", "votes"], box: ["recent"] };
+const LAZY = { voters: "watchVoters", votes: "watchVotes", recent: "watchRecent" };
 const isOpenNow = () => S.settings.status === "buka";
 
 const Admin = (() => {
   function start() { loadingView("Memuat dashboard…"); renderShell(); }
-  function stop() { cancelAnimationFrame(A.raf); A.cur = null; A.tokens = null; A.P = { q: "", kat: "", kelas: "", st: "", page: 1, sel: new Set() }; A.tk.sel = new Set(); A.rs.votes = new Set(); A.rs.voters = new Set(); }
+  function stop() { cancelAnimationFrame(A.raf); A.cur?.destroy?.(); Object.values(S.lazy).forEach((u) => { try { u(); } catch (e) { /* abaikan */ } }); S.lazy = {}; A.cur = null; A.recomputing = false; A.drift = null; A.tokens = null; A.P = { q: "", kat: "", kelas: "", st: "", page: 1, sel: new Set() }; A.tk.sel = new Set(); A.rs.votes = new Set(); A.rs.voters = new Set(); }
   function renderShell() {
     view().innerHTML = `<div class="sh ev-bg"><aside class="sb"><div class="sb-brand"><span class="logo-badge"><img src="${LOGO}" alt="Logo sekolah"></span><div><b>E-Voting OSIS</b><span>${esc(APP.sekolah)}</span></div></div>
       ${NAV.map(([k, l, i]) => `<button class="nav-btn" data-nav="${k}">${ic(i)}<span>${l}</span></button>`).join("")}
@@ -940,24 +1024,46 @@ const Admin = (() => {
     A.page = p;
     $$("[data-nav]").forEach((b) => { const on = b.dataset.nav === p; b.classList.toggle("on", on); if (on) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current"); });
     $("#ad-title").textContent = NAV.find((x) => x[0] === p)[1];
-    const pg = $("#ad-pg"); pg.innerHTML = ""; pg.scrollTop = 0; $("#ev").scrollTop = 0;
-    A.cur = Pages[p](); A.cur.mount(pg); A.cur.update?.(); statusChip();
+    A.cur?.destroy?.();
+    // Wadah halaman diganti baru setiap kali pindah halaman agar pendengar klik halaman sebelumnya tidak menumpuk (dulu: tombol Buka/Tutup di dashboard bisa terpanggil berkali-kali)
+    const old = $("#ad-pg"), pg = old.cloneNode(false); old.replaceWith(pg); $("#ev").scrollTop = 0;
+    A.drift = null; syncNeeds(p);
+    A.cur = Pages[p](); A.cur.mount(pg); A.cur.update?.(); statusChip(); overlay();
+  }
+  // Berlangganan data besar hanya untuk halaman aktif; lepas langganan saat pindah halaman agar tidak menghabiskan kuota baca
+  function syncNeeds(p) {
+    const need = new Set(NEEDS[p] || []);
+    for (const k of Object.keys(LAZY)) {
+      if (need.has(k) && !S.lazy[k]) { S.ready[k] = false; S.lazy[k] = S.db[LAZY[k]]((d) => { S[k] = d; onData(k); }, dataErr); }
+      else if (!need.has(k) && S.lazy[k]) { S.lazy[k](); delete S.lazy[k]; S[k] = []; S.ready[k] = false; }
+    }
+  }
+  const loaded = () => (NEEDS[A.page] || []).every((k) => S.ready[k]);
+  function overlay() {
+    const pg = $("#ad-pg"); if (!pg) return; const ov = $(".ld-ov", pg);
+    if (loaded()) { ov?.remove(); pg.classList.remove("ld"); }
+    else if (!ov) { pg.classList.add("ld"); pg.insertAdjacentHTML("beforeend", `<div class="ld-ov" role="status"><div class="spin"></div><b>Memuat data…</b></div>`); }
   }
   function statusChip() { const s = $("#ad-status"); if (s) s.innerHTML = isOpenNow() ? `<span class="chip ok"><i class="dot"></i> Pemungutan suara dibuka</span>` : `<span class="chip bad"><i class="dot"></i> Pemungutan suara ditutup</span>`; }
-  function onData() { cancelAnimationFrame(A.raf); A.raf = requestAnimationFrame(() => { statusChip(); A.cur?.update?.(); }); }
-  return { start, stop, onData, show };
+  function refresh(kind) {
+    if (kind === "stats" && S.ready.stats && !S.stats && !A.recomputing) { // penghitung belum ada (data lama): bangun otomatis dari data asli
+      A.recomputing = true; S.db.recomputeStats().catch(dataErr).finally(() => { A.recomputing = false; });
+    }
+    cancelAnimationFrame(A.raf); A.raf = requestAnimationFrame(() => { statusChip(); A.cur?.update?.(); overlay(); });
+  }
+  return { start, stop, onData: refresh, show };
 })();
 
 // ---------- Fungsi bantu admin ----------
 function computeStats() {
-  const total = S.voters.length, voted = S.voters.filter((v) => v.sudahMemilih).length;
-  const cnt = new Map(), byBilik = new Map(), byK = new Map(), kv = new Map();
-  S.votes.forEach((v) => { cnt.set(v.calonId, (cnt.get(v.calonId) || 0) + 1); byBilik.set(v.bilik || "-", (byBilik.get(v.bilik || "-") || 0) + 1); byK.set(v.kelas, (byK.get(v.kelas) || 0) + 1); });
-  S.voters.forEach((v) => { const o = kv.get(v.kelas) || { total: 0, voted: 0 }; o.total++; if (v.sudahMemilih) o.voted++; kv.set(v.kelas, o); });
-  const list = [...S.cands].sort((a, b) => (a.noUrut || 0) - (b.noUrut || 0)).map((c) => ({ c, n: cnt.get(c.id) || 0 }));
-  const orphan = [...cnt.entries()].filter(([id]) => !S.cands.some((c) => c.id === id)).reduce((a, [, n]) => a + n, 0);
-  const th = TINGKAT.map((t) => { const vs = S.voters.filter((v) => v.tingkat === t); return { t, total: vs.length, voted: vs.filter((v) => v.sudahMemilih).length }; });
-  return { total, voted, left: total - voted, part: pct(voted, total), list, orphan, totalVotes: S.votes.length, byBilik, byK, kv, th };
+  const z = S.stats || buildStats([], []), kv = new Map(), byBilik = new Map(Object.entries(z.bilik || {}).filter(([, n]) => n > 0));
+  Object.entries(z.kelas || {}).forEach(([k, o]) => { if ((o.t || 0) > 0 || (o.v || 0) > 0) kv.set(k, { total: Math.max(0, o.t || 0), voted: Math.max(0, o.v || 0) }); });
+  let total = 0, voted = 0; kv.forEach((o) => { total += o.total; voted += o.voted; });
+  const cnt = new Map(Object.entries(z.cand || {}));
+  const list = [...S.cands].sort((a, b) => (a.noUrut || 0) - (b.noUrut || 0)).map((c) => ({ c, n: Math.max(0, cnt.get(c.id) || 0) }));
+  const orphan = [...cnt.entries()].filter(([id]) => !S.cands.some((c) => c.id === id)).reduce((a, [, n]) => a + Math.max(0, n), 0);
+  const th = TINGKAT.map((t) => { let tt = 0, vv = 0; kv.forEach((o, k) => { if ((parseKelas(k) || {}).tingkat === t) { tt += o.total; vv += o.voted; } }); return { t, total: tt, voted: vv }; });
+  return { total, voted, left: total - voted, part: pct(voted, total), list, orphan, totalVotes: Math.max(0, z.votes || 0), votedCounter: Math.max(0, z.voted || 0), byBilik, kv, th };
 }
 function downloadXlsx(name, aoa, sheet = "Data") {
   if (!window.XLSX) return toast("Pustaka Excel belum termuat. Periksa koneksi internet.", "err");
@@ -984,7 +1090,7 @@ function bindPicker(el, sel, rerender) {
 // ---------- Dashboard / Quick count ----------
 Pages.dash = () => ({
   mount(el) {
-    el.innerHTML = `<div class="tiles" id="d-tiles"></div><div class="grid2"><section class="card glass" id="d-qc"></section><section class="card glass qc" id="d-side"></section></div><section class="card glass"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h3 style="color:var(--c-navy)">Partisipasi per kelas</h3><span class="small muted">Realtime dari semua bilik</span></div><div class="cls-grid" id="d-cls"></div></section>`;
+    el.innerHTML = `<div id="d-note"></div><div class="tiles" id="d-tiles"></div><div class="grid2"><section class="card glass" id="d-qc"></section><section class="card glass qc" id="d-side"></section></div><section class="card glass"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h3 style="color:var(--c-navy)">Partisipasi per kelas</h3><span class="small muted">Realtime dari semua bilik</span></div><div class="cls-grid" id="d-cls"></div></section>`;
     el.addEventListener("click", async (e) => {
       const t = e.target.closest("[data-act]"); if (!t) return;
       if (t.dataset.act === "toggle-open") {
@@ -992,11 +1098,33 @@ Pages.dash = () => ({
         try { await S.db.saveSettings({ status: isOpenNow() ? "tutup" : "buka" }); toast(isOpenNow() ? "Pemungutan suara dibuka" : "Pemungutan suara ditutup", "ok"); } catch (er) { dataErr(er); }
       }
       if (t.dataset.act === "show-res") { try { await S.db.saveSettings({ tampilHasil: !S.settings.tampilHasil }); } catch (er) { dataErr(er); } }
+      if (t.dataset.act === "recount") {
+        if (!(await askConfirm({ title: "Hitung ulang penghitung?", msg: "Angka dashboard dihitung ulang dari seluruh data pemilih dan suara (membaca semua dokumen satu kali). Sebaiknya lakukan saat tidak ada pemilih yang sedang mengirim suara.", ok: "Hitung ulang" }))) return;
+        setBusy(t, true, "Menghitung…");
+        try { await S.db.recomputeStats(); A.drift = null; toast("Penghitung dihitung ulang", "ok"); } catch (er) { dataErr(er); }
+        setBusy(t, false); A.cur?.update?.();
+      }
     });
+    // Pemeriksaan murah (hitung dokumen di server, ~6 pembacaan) apakah penghitung masih sama dengan data asli
+    const ck = A.ck = { busy: false };
+    const run = async () => {
+      if (ck.busy || document.hidden || !S.stats || A.page !== "dash") return; ck.busy = true;
+      try {
+        const bad = (r) => { const st = computeStats(); return r.votes !== (S.stats.votes || 0) || r.voted !== (S.stats.voted || 0) || r.total !== st.total; };
+        let r = await S.db.verifyStats(), b = bad(r);
+        if (b) { await sleep(4000); r = await S.db.verifyStats(); b = bad(r); } // ulangi sekali: bisa saja ada suara yang baru masuk
+        A.drift = b ? r : null; A.cur?.update?.();
+      } catch (e) { /* pemeriksaan gagal: jangan ganggu dashboard */ } finally { ck.busy = false; }
+    };
+    ck.t1 = setTimeout(run, 2500); ck.iv = setInterval(run, 120000);
   },
+  destroy() { if (A.ck) { clearTimeout(A.ck.t1); clearInterval(A.ck.iv); A.ck = null; } },
   update() {
     const st = computeStats(), show = S.settings.tampilHasil !== false, max = Math.max(1, ...st.list.map((x) => x.n));
     const lead = show && st.list.length && st.list.some((x) => x.n > 0) ? Math.max(...st.list.map((x) => x.n)) : -1;
+    $("#d-note").innerHTML = S.statsErr ? `<div class="alert err" style="margin-bottom:14px">${ic("alert")}<div><b>Penghitung dashboard tidak bisa dibaca.</b> ${S.statsErr.code === "permission-denied" ? "Aturan Firestore versi terbaru belum dipublikasikan. Buka Firebase Console → Firestore Database → Rules, tempel isi file <b>firestore.rules</b> terbaru, lalu klik Publish dan muat ulang halaman ini. Pemungutan suara tetap berjalan normal, hanya angka dashboard yang belum tampil." : "Periksa koneksi internet lalu muat ulang halaman."}</div></div>`
+      : S.ready.stats && !S.stats ? `<div class="alert">${ic("alert")}<div><b>Menyiapkan penghitung.</b> Data pemilih dan suara dibaca satu kali untuk membangun angka dashboard. Mohon tunggu beberapa detik.</div></div>`
+      : A.drift ? `<div class="alert err" style="margin-bottom:14px">${ic("alert")}<div><b>Penghitung tidak sama dengan data asli.</b> Penghitung: ${fmtNum(S.stats.votes || 0)} suara, ${fmtNum(st.voted)} sudah memilih, ${fmtNum(st.total)} pemilih. Data asli: ${fmtNum(A.drift.votes)} suara, ${fmtNum(A.drift.voted)} sudah memilih, ${fmtNum(A.drift.total)} pemilih.<div style="margin-top:8px"><button class="btn sm" data-act="recount">${ic("reset")} Hitung ulang penghitung</button></div></div></div>` : "";
     $("#d-tiles").innerHTML = [["Total pemilih", fmtNum(st.total), "users"], ["Sudah memilih", fmtNum(st.voted), "check"], ["Belum memilih", fmtNum(st.left), "list"], ["Partisipasi", st.part + "%", "chart"]].map(([k, v, i]) => `<div class="card glass tile"><span class="k">${ic(i)} ${k}</span><span class="v">${v}</span></div>`).join("");
     $("#d-qc").innerHTML = `<div class="row" style="justify-content:space-between;margin-bottom:16px"><div><h3 style="color:var(--c-navy)">Quick count</h3><span class="small muted">${fmtNum(st.totalVotes)} suara masuk</span></div><label class="row small" style="gap:8px;font-weight:700"><span>Tampilkan hasil</span><span class="sw"><input type="checkbox" data-act="show-res" ${show ? "checked" : ""} aria-label="Tampilkan hasil"><i></i></span></label></div>
       ${!show ? `<div class="alert warn" style="margin-bottom:14px">${ic("eyeoff")}<div>Hasil disembunyikan. Angka tidak tampil sampai saklar dinyalakan.</div></div>` : ""}
@@ -1006,7 +1134,7 @@ Pages.dash = () => ({
       <button class="btn ${isOpenNow() ? "red" : "green"}" data-act="toggle-open">${ic("power")} ${isOpenNow() ? "Tutup pemungutan suara" : "Buka pemungutan suara"}</button>
       <div class="prog"><div class="row" style="justify-content:space-between"><b>Partisipasi</b><span>${fmtNum(st.voted)} / ${fmtNum(st.total)}</span></div><div class="bar g"><i style="width:${st.part}%"></i></div></div>
       <div class="prog">${st.th.map((x) => `<div><div class="row small" style="justify-content:space-between"><b>${esc(tingkatLabel(x.t))}</b><span class="muted">${fmtNum(x.voted)} / ${fmtNum(x.total)} · ${pct(x.voted, x.total)}%</span></div><div class="bar"><i style="width:${pct(x.voted, x.total)}%"></i></div></div>`).join("")}</div>
-      ${st.byBilik.size ? `<div><div class="lbl" style="margin-bottom:6px">Suara per bilik</div><div class="row">${[...st.byBilik.entries()].sort().map(([b, n]) => `<span class="chip">${esc(b)}: ${fmtNum(n)}</span>`).join("")}</div></div>` : ""}
+      ${st.byBilik.size ? `<div><div class="lbl" style="margin-bottom:6px">Pemilih per bilik</div><div class="row">${[...st.byBilik.entries()].sort().map(([b, n]) => `<span class="chip">${esc(b)}: ${fmtNum(n)}</span>`).join("")}</div></div>` : ""}
       ${mism ? `<div class="alert warn">${ic("alert")}<div><b>Jumlah tidak sama.</b> Suara di kotak ${fmtNum(st.totalVotes)}, pemilih berstatus sudah memilih ${fmtNum(st.voted)}. Ini wajar setelah reset atau hapus data. Jika terjadi tanpa reset, periksa kotak suara.</div></div>` : `<div class="alert ok">${ic("shield")}<div>Jumlah suara sama dengan jumlah pemilih yang sudah memilih.</div></div>`}`;
     const ks = [...st.kv.keys()].sort(kelasSort);
     $("#d-cls").innerHTML = ks.length ? ks.map((k) => { const o = st.kv.get(k), p = pct(o.voted, o.total); return `<div class="cls"><b>${esc(k)}</b><div class="bar ${p >= 100 ? "g" : ""}"><i style="width:${p}%"></i></div><span class="muted">${o.voted}/${o.total} · ${p}%</span></div>`; }).join("") : `<div class="empty" style="grid-column:1/-1">${ic("users")}<b>Belum ada data pemilih</b><span>Import data siswa di menu Data Pemilih.</span></div>`;
@@ -1015,13 +1143,13 @@ Pages.dash = () => ({
 
 // ---------- Kotak suara ----------
 Pages.box = () => ({
-  mount(el) { el.innerHTML = `<div class="tiles" id="b-tiles"></div><section class="card glass" id="b-sum"></section><section class="card glass"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h3 style="color:var(--c-navy)">Log suara masuk</h3><button class="btn red sm" id="b-reset">${ic("reset")} Reset kotak suara…</button></div><p class="small muted" style="margin-bottom:12px">Suara tidak menyimpan NIPD maupun nama pemilih. Hanya kelas, bilik, dan waktu.</p><div id="b-log"></div></section>`; $("#b-reset").addEventListener("click", () => Admin.show("reset")); },
+  mount(el) { el.innerHTML = `<div class="tiles" id="b-tiles"></div><section class="card glass" id="b-sum"></section><section class="card glass"><div class="row" style="justify-content:space-between;margin-bottom:12px"><h3 style="color:var(--c-navy)">Log pemilih terbaru</h3><button class="btn red sm" id="b-reset">${ic("reset")} Reset kotak suara…</button></div><p class="small muted" style="margin-bottom:12px">Log ini hanya mencatat siapa yang sudah memilih dan kapan, tanpa pilihannya. Dokumen suara hanya menyimpan pasangan calon dan kelas, tanpa NIPD, nama, waktu, maupun bilik, supaya pilihan tidak bisa dicocokkan dengan pemilih.</p><div id="b-log"></div></section>`; $("#b-reset").addEventListener("click", () => Admin.show("reset")); },
   update() {
     const st = computeStats(), show = S.settings.tampilHasil !== false;
     $("#b-tiles").innerHTML = [["Suara di kotak", fmtNum(st.totalVotes), "box"], ["Pemilih sudah memilih", fmtNum(st.voted), "check"], ["Selisih", fmtNum(Math.abs(st.totalVotes - st.voted)), "alert"]].map(([k, v, i]) => `<div class="card glass tile"><span class="k">${ic(i)} ${k}</span><span class="v">${v}</span></div>`).join("");
     $("#b-sum").innerHTML = `<h3 style="color:var(--c-navy);margin-bottom:12px">Ringkasan per pasangan calon</h3>${show ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>No</th><th>Pasangan calon</th><th>Suara</th><th>Persen</th></tr></thead><tbody>${st.list.map(({ c, n }) => `<tr><td><b>${esc(c.noUrut)}</b></td><td>${esc(pairName(c))}</td><td>${fmtNum(n)}</td><td>${pct(n, st.totalVotes)}%</td></tr>`).join("") || `<tr><td colspan="4" class="muted">Belum ada calon.</td></tr>`}</tbody></table></div>` : `<div class="alert warn">${ic("eyeoff")}<div>Hasil disembunyikan. Nyalakan "Tampilkan hasil" di Dashboard.</div></div>`}`;
-    const rows = [...S.votes].sort((a, b) => (b.waktu || 0) - (a.waktu || 0)).slice(0, 100);
-    $("#b-log").innerHTML = rows.length ? `<div class="tbl-wrap" style="max-height:420px"><table class="tbl"><thead><tr><th>Waktu</th><th>Bilik</th><th>Kelas</th><th>Pilihan</th></tr></thead><tbody>${rows.map((v) => { const c = S.cands.find((x) => x.id === v.calonId); return `<tr><td>${fmtTime(v.waktu)}</td><td>${esc(v.bilik)}</td><td>${esc(v.kelas)}</td><td>${show ? (c ? `No. ${esc(c.noUrut)} · ${esc(pairName(c))}` : "Calon dihapus") : "•••"}</td></tr>`; }).join("")}</tbody></table></div><p class="small muted" style="margin-top:8px">Menampilkan ${rows.length} dari ${fmtNum(S.votes.length)} suara terbaru.</p>` : `<div class="empty">${ic("box")}<b>Kotak suara kosong</b><span>Belum ada suara masuk.</span></div>`;
+    const rows = [...S.recent].sort((a, b) => (b.waktuMemilih || 0) - (a.waktuMemilih || 0)).slice(0, 100);
+    $("#b-log").innerHTML = rows.length ? `<div class="tbl-wrap" style="max-height:420px"><table class="tbl"><thead><tr><th>Waktu</th><th>Bilik</th><th>Nama</th><th>Kelas</th></tr></thead><tbody>${rows.map((v) => `<tr><td>${fmtTime(v.waktuMemilih)}</td><td>${esc(v.bilik || "-")}</td><td>${esc(v.nama)}</td><td>${esc(kelasLabel(v.kelas))}</td></tr>`).join("")}</tbody></table></div><p class="small muted" style="margin-top:8px">Menampilkan ${rows.length} dari ${fmtNum(st.voted)} pemilih yang sudah memilih.</p>` : `<div class="empty">${ic("box")}<b>Belum ada yang memilih</b><span>Pemilih yang sudah memilih akan tampil di sini.</span></div>`;
   }
 });
 
@@ -1157,7 +1285,7 @@ async function regen(list) {
 async function delVoters(list) {
   if (!list.length) return;
   if (!(await askConfirm({ title: "Hapus pemilih?", msg: list.length > 1 ? `Menghapus <b>${fmtNum(list.length)} pemilih</b> beserta tokennya. Suara yang sudah masuk di kotak suara tidak ikut terhapus.` : `Menghapus <b>${esc(list[0].nama)}</b> (${esc(list[0].nipd)}) beserta tokennya.`, ok: "Hapus", danger: true, type: list.length > 10 ? "HAPUS" : "" }))) return;
-  try { await S.db.deleteVoters(list.map((v) => v.nipd)); list.forEach((v) => A.P.sel.delete(v.nipd)); if (A.tokens) list.forEach((v) => delete A.tokens[v.nipd]); toast(`${fmtNum(list.length)} pemilih dihapus`, "ok"); } catch (e) { dataErr(e); }
+  try { await S.db.deleteVoters(list); list.forEach((v) => A.P.sel.delete(v.nipd)); if (A.tokens) list.forEach((v) => delete A.tokens[v.nipd]); toast(`${fmtNum(list.length)} pemilih dihapus`, "ok"); } catch (e) { dataErr(e); }
 }
 function voterForm(v) {
   const edit = !!v, g0 = isGuru(v), ks = [...new Set(S.voters.filter((x) => !isGuru(x)).map((x) => x.kelas))].sort(kelasSort);
@@ -1173,7 +1301,7 @@ function voterForm(v) {
         if (!edit && S.voters.some((x) => x.nipd === nipd)) return err((guru ? "NIP/ID" : "NIPD") + " sudah terdaftar.");
         setBusy(btn, true, "Menyimpan…");
         try {
-          if (edit) await S.db.upsertVoters([{ isNew: false, nipd, nama, kelas: kl.kelas, tingkat: kl.tingkat, kategori }]);
+          if (edit) await S.db.upsertVoters([{ isNew: false, nipd, nama, kelas: kl.kelas, tingkat: kl.tingkat, kategori, prev: { kelas: v.kelas, sudahMemilih: !!v.sudahMemilih } }]);
           else { const [t] = await makeTokenItems([{ nipd }]); await S.db.upsertVoters([{ isNew: true, nipd, nama, kelas: kl.kelas, tingkat: kl.tingkat, kategori, token: t.token, tokenHash: t.tokenHash }]); if (A.tokens) A.tokens[nipd] = t.token; close(); showTokenModal("Pemilih ditambahkan", [{ nipd, nama, token: t.token }]); return; }
           close(); toast("Data pemilih tersimpan", "ok");
         } catch (e) { setBusy(btn, false); err(explainErr(e)); }
@@ -1218,11 +1346,11 @@ function openImport() {
     actions: [{ label: "Tutup", cls: "ghost" }, {
       label: "Mulai import", id: "im-go", onClick: async (close, el, btn) => {
         if (!parsed || !parsed.rows.length) return toast("Pilih file yang valid dulu", "err");
-        const mode = $("input[name=im-mode]:checked", el).value, exist = new Set(S.voters.map((v) => v.nipd)), items = [];
+        const mode = $("input[name=im-mode]:checked", el).value, byId = new Map(S.voters.map((v) => [v.nipd, v])), exist = new Set(byId.keys()), items = [];
         btn.disabled = true; $("#im-pg", el).hidden = false; $("#im-pt", el).textContent = "Membuat token…";
         try {
           for (const r of parsed.rows) {
-            if (exist.has(r.nipd)) { if (mode === "update") items.push({ isNew: false, ...r }); }
+            if (exist.has(r.nipd)) { if (mode === "update") { const o = byId.get(r.nipd); items.push({ isNew: false, ...r, prev: { kelas: o.kelas, sudahMemilih: !!o.sudahMemilih } }); } }
             else { const token = genToken(); items.push({ isNew: true, ...r, token, tokenHash: await hashToken(r.nipd, token) }); }
           }
           if (!items.length) { btn.disabled = false; $("#im-pt", el).textContent = "Tidak ada data baru untuk diimport."; return; }
@@ -1364,17 +1492,17 @@ Pages.reset = () => {
   };
 };
 async function resetVotesAction(btn) {
-  const R = A.rs, ks = R.votes, ids = S.votes.filter((v) => ks.has(v.kelas)).map((v) => v.id), nipds = R.revote ? S.voters.filter((v) => ks.has(v.kelas) && v.sudahMemilih).map((v) => v.nipd) : [];
+  const R = A.rs, ks = R.votes, ids = S.votes.filter((v) => ks.has(v.kelas)), nipds = R.revote ? S.voters.filter((v) => ks.has(v.kelas) && v.sudahMemilih) : [];
   if (!(await askConfirm({ title: "Reset kotak suara?", msg: `Menghapus <b>${fmtNum(ids.length)} suara</b> dari <b>${ks.size} kelas</b> (${[...ks].sort(kelasSort).slice(0, 8).map(esc).join(", ")}${ks.size > 8 ? ", …" : ""}).${R.revote ? `<br>${fmtNum(nipds.length)} pemilih akan bisa memilih ulang.` : "<br>Status pemilih tidak diubah."}<br><b>Tindakan ini tidak bisa dibatalkan.</b>`, ok: "Reset kotak suara", danger: true, type: "RESET" }))) return;
   setBusy(btn, true, "Menghapus…");
   try { if (ids.length) await S.db.deleteVotes(ids); if (nipds.length) await S.db.resetVoterStatus(nipds); R.votes.clear(); toast(`${fmtNum(ids.length)} suara dihapus`, "ok"); } catch (e) { dataErr(e); }
   setBusy(btn, false); A.cur?.update();
 }
 async function deleteVotersAction(btn) {
-  const R = A.rs, ks = R.voters, list = S.voters.filter((v) => ks.has(v.kelas)), ids = R.alsoVotes ? S.votes.filter((v) => ks.has(v.kelas)).map((v) => v.id) : [];
+  const R = A.rs, ks = R.voters, list = S.voters.filter((v) => ks.has(v.kelas)), ids = R.alsoVotes ? S.votes.filter((v) => ks.has(v.kelas)) : [];
   if (!(await askConfirm({ title: "Hapus pemilih?", msg: `Menghapus <b>${fmtNum(list.length)} pemilih</b> dari <b>${ks.size} kelas</b> beserta tokennya.${ids.length ? `<br>${fmtNum(ids.length)} suara dari kelas itu ikut dihapus.` : "<br>Suara di kotak suara tidak dihapus."}<br><b>Tindakan ini tidak bisa dibatalkan.</b>`, ok: "Hapus pemilih", danger: true, type: "HAPUS" }))) return;
   setBusy(btn, true, "Menghapus…");
-  try { if (ids.length) await S.db.deleteVotes(ids); await S.db.deleteVoters(list.map((v) => v.nipd)); A.tokens = null; A.P.sel.clear(); R.voters.clear(); toast(`${fmtNum(list.length)} pemilih dihapus`, "ok"); } catch (e) { dataErr(e); }
+  try { if (ids.length) await S.db.deleteVotes(ids); await S.db.deleteVoters(list); A.tokens = null; A.P.sel.clear(); R.voters.clear(); toast(`${fmtNum(list.length)} pemilih dihapus`, "ok"); } catch (e) { dataErr(e); }
   setBusy(btn, false); A.cur?.update();
 }
 
